@@ -16,6 +16,8 @@
 #if canImport(Network)
     import Network
 #endif
+import Baggage
+@testable import Instrumentation // @testable to access `bootstrapInternal`
 import Logging
 import NIO
 import NIOConcurrencyHelpers
@@ -79,6 +81,8 @@ class HTTPClientTests: XCTestCase {
 
         XCTAssertNotNil(self.backgroundLogStore)
         self.backgroundLogStore = nil
+
+        InstrumentationSystem.bootstrapInternal(nil)
     }
 
     func testRequestURI() throws {
@@ -2433,6 +2437,28 @@ class HTTPClientTests: XCTestCase {
             // No background activity expected here.
             XCTAssertEqual(0, backgroundLogStore.allEntries.count)
         })
+    }
+
+    func testRequestWithBaggage() throws {
+        InstrumentationSystem.bootstrapInternal(TestInstrument())
+        let logStore = CollectEverythingLogHandler.LogStore()
+        var logger = Logger(label: #function, factory: { _ in
+            CollectEverythingLogHandler(logStore: logStore)
+        })
+        logger.logLevel = .trace
+        var baggage = Baggage.topLevel
+        baggage.testInstrumentID = "test"
+        let context = DefaultLoggingContext(logger: logger, baggage: baggage)
+        let request = try Request(url: self.defaultHTTPBinURLPrefix + "get")
+        let response = try self.defaultClient.execute(request: request, context: context).wait()
+        XCTAssertEqual(.ok, response.status)
+        XCTAssert(
+            logStore.allEntries.allSatisfy { entry in
+                entry.metadata.contains(where: { $0.key == TestInstrumentIDKey.nameOverride && $0.value == "test" })
+            }
+        )
+        let headers = try XCTUnwrap(InstrumentationSystem.testInstrument?.carrierAfterInjection as? HTTPHeaders)
+        XCTAssertEqual(headers, [TestInstrumentIDKey.headerName: "test"])
     }
 
     func testClosingIdleConnectionsInPoolLogsInTheBackground() {

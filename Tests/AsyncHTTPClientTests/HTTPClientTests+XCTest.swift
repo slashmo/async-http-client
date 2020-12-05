@@ -117,6 +117,7 @@ extension HTTPClientTests {
             ("testLoggingCorrectlyAttachesRequestInformation", testLoggingCorrectlyAttachesRequestInformation),
             ("testNothingIsLoggedAtInfoOrHigher", testNothingIsLoggedAtInfoOrHigher),
             ("testAllMethodsLog", testAllMethodsLog),
+            ("testRequestWithBaggage", testRequestWithBaggage),
             ("testClosingIdleConnectionsInPoolLogsInTheBackground", testClosingIdleConnectionsInPoolLogsInTheBackground),
             ("testUploadStreamingNoLength", testUploadStreamingNoLength),
             ("testConnectErrorPropagatedToDelegate", testConnectErrorPropagatedToDelegate),

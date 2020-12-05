@@ -13,7 +13,9 @@
 //===----------------------------------------------------------------------===//
 
 import AsyncHTTPClient
+import CoreBaggage
 import Foundation
+import Instrumentation
 import Logging
 import NIO
 import NIOConcurrencyHelpers
@@ -992,6 +994,52 @@ class HTTPEchoHandler: ChannelInboundHandler {
             context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
             context.close(promise: nil)
         }
+    }
+}
+
+internal enum TestInstrumentIDKey: Baggage.Key {
+    typealias Value = String
+    static let nameOverride: String? = "instrumentation-test-id"
+    static let headerName = "x-instrumentation-test-id"
+}
+
+internal extension Baggage {
+    var testInstrumentID: String? {
+        get {
+            return self[TestInstrumentIDKey.self]
+        }
+        set {
+            self[TestInstrumentIDKey.self] = newValue
+        }
+    }
+}
+
+internal final class TestInstrument: Instrument {
+    private(set) var carrierAfterInjection: Any?
+
+    func inject<Carrier, Inject>(
+        _ baggage: Baggage,
+        into carrier: inout Carrier,
+        using injector: Inject
+    ) where Carrier == Inject.Carrier, Inject: Injector {
+        if let testID = baggage.testInstrumentID {
+            injector.inject(testID, forKey: TestInstrumentIDKey.headerName, into: &carrier)
+            self.carrierAfterInjection = carrier
+        }
+    }
+
+    func extract<Carrier, Extract>(
+        _ carrier: Carrier,
+        into baggage: inout Baggage,
+        using extractor: Extract
+    ) where Carrier == Extract.Carrier, Extract: Extractor {
+        // no-op
+    }
+}
+
+internal extension InstrumentationSystem {
+    static var testInstrument: TestInstrument? {
+        InstrumentationSystem.instrument as? TestInstrument
     }
 }
 
