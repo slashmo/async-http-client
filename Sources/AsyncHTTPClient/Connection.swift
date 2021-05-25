@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Baggage
 import Foundation
 import Logging
 import NIO
@@ -51,21 +52,21 @@ extension Connection {
     /// Release this `Connection` to its associated `HTTP1ConnectionProvider`.
     ///
     /// - Warning: This only releases the connection and doesn't take care of cleaning handlers in the `Channel` pipeline.
-    func release(closing: Bool, logger: Logger) {
+    func release(closing: Bool, context: LoggingContext) {
         self.channel.eventLoop.assertInEventLoop()
-        self.provider.release(connection: self, closing: closing, logger: logger)
+        self.provider.release(connection: self, closing: closing, context: context)
     }
 
     /// Called when channel exceeds idle time in pool.
-    func timeout(logger: Logger) {
+    func timeout(context: LoggingContext) {
         self.channel.eventLoop.assertInEventLoop()
-        self.provider.timeout(connection: self, logger: logger)
+        self.provider.timeout(connection: self, context: context)
     }
 
     /// Called when channel goes inactive while in the pool.
-    func remoteClosed(logger: Logger) {
+    func remoteClosed(context: LoggingContext) {
         self.channel.eventLoop.assertInEventLoop()
-        self.provider.remoteClosed(connection: self, logger: logger)
+        self.provider.remoteClosed(connection: self, context: context)
     }
 
     /// Called from `HTTP1ConnectionProvider.close` when client is shutting down.
@@ -104,9 +105,9 @@ extension Connection: PoolManageableConnection {
 
 extension Connection {
     /// Sets idle timeout handler and channel inactivity listener.
-    func setIdleTimeout(timeout: TimeAmount?, logger: Logger) {
+    func setIdleTimeout(timeout: TimeAmount?, context: LoggingContext) {
         _ = self.channel.pipeline.addHandler(IdleStateHandler(writeTimeout: timeout), position: .first).flatMap { _ in
-            self.channel.pipeline.addHandler(IdlePoolConnectionHandler(connection: self, logger: logger))
+            self.channel.pipeline.addHandler(IdlePoolConnectionHandler(connection: self, loggingContext: context))
         }
     }
 
@@ -123,19 +124,19 @@ class IdlePoolConnectionHandler: ChannelInboundHandler, RemovableChannelHandler 
 
     let connection: Connection
     var eventSent: Bool
-    let logger: Logger
+    let loggingContext: LoggingContext
 
-    init(connection: Connection, logger: Logger) {
+    init(connection: Connection, loggingContext: LoggingContext) {
         self.connection = connection
         self.eventSent = false
-        self.logger = logger
+        self.loggingContext = loggingContext
     }
 
     // this is needed to detect when remote end closes connection while connection is in the pool idling
     func channelInactive(context: ChannelHandlerContext) {
         if !self.eventSent {
             self.eventSent = true
-            self.connection.remoteClosed(logger: self.logger)
+            self.connection.remoteClosed(context: loggingContext)
         }
     }
 
@@ -143,7 +144,7 @@ class IdlePoolConnectionHandler: ChannelInboundHandler, RemovableChannelHandler 
         if let idleEvent = event as? IdleStateHandler.IdleStateEvent, idleEvent == .write {
             if !self.eventSent {
                 self.eventSent = true
-                self.connection.timeout(logger: self.logger)
+                self.connection.timeout(context: loggingContext)
             }
         } else {
             context.fireUserInboundEventTriggered(event)

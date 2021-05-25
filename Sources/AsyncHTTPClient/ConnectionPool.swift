@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Baggage
 import Foundation
 import Logging
 import NIO
@@ -76,7 +77,7 @@ final class ConnectionPool {
                        taskEventLoop: EventLoop,
                        deadline: NIODeadline?,
                        setupComplete: EventLoopFuture<Void>,
-                       logger: Logger) -> EventLoopFuture<Connection> {
+                       context: LoggingContext) -> EventLoopFuture<Connection> {
         let key = Key(request)
 
         let provider: HTTP1ConnectionProvider = self.lock.withLock {
@@ -95,7 +96,7 @@ final class ConnectionPool {
             }
         }
 
-        return provider.getConnection(preference: preference, setupComplete: setupComplete, logger: logger)
+        return provider.getConnection(preference: preference, setupComplete: setupComplete, context: context)
     }
 
     func delete(_ provider: HTTP1ConnectionProvider) {
@@ -240,66 +241,65 @@ class HTTP1ConnectionProvider {
         self.state.assertInvariants()
     }
 
-    func execute(_ action: Action<Connection>, logger: Logger) {
+    func execute(_ action: Action<Connection>, context: LoggingContext) {
         switch action {
         case .lease(let connection, let waiter):
             // if connection is became inactive, we create a new one.
             connection.cancelIdleTimeout().whenComplete { _ in
                 if connection.isActiveEstimation {
-                    logger.trace("leasing existing connection",
+                    context.logger.trace("leasing existing connection",
                                  metadata: ["ahc-connection": "\(connection)"])
                     waiter.promise.succeed(connection)
                 } else {
-                    logger.trace("opening fresh connection (found matching but inactive connection)",
+                    context.logger.trace("opening fresh connection (found matching but inactive connection)",
                                  metadata: ["ahc-dead-connection": "\(connection)"])
-                    self.makeChannel(preference: waiter.preference,
-                                     logger: logger).whenComplete { result in
-                        self.connect(result, waiter: waiter, logger: logger)
+                    self.makeChannel(preference: waiter.preference, context: context).whenComplete { result in
+                        self.connect(result, waiter: waiter, context: context)
                     }
                 }
             }
         case .create(let waiter):
-            logger.trace("opening fresh connection (no connections to reuse available)")
-            self.makeChannel(preference: waiter.preference, logger: logger).whenComplete { result in
-                self.connect(result, waiter: waiter, logger: logger)
+            context.logger.trace("opening fresh connection (no connections to reuse available)")
+            self.makeChannel(preference: waiter.preference, context: context).whenComplete { result in
+                self.connect(result, waiter: waiter, context: context)
             }
         case .replace(let connection, let waiter):
             connection.cancelIdleTimeout().flatMap {
                 connection.close()
             }.whenComplete { _ in
-                logger.trace("opening fresh connection (replacing exising connection)",
+                context.logger.trace("opening fresh connection (replacing exising connection)",
                              metadata: ["ahc-old-connection": "\(connection)",
                                         "ahc-waiter": "\(waiter)"])
-                self.makeChannel(preference: waiter.preference, logger: logger).whenComplete { result in
-                    self.connect(result, waiter: waiter, logger: logger)
+                self.makeChannel(preference: waiter.preference, context: context).whenComplete { result in
+                    self.connect(result, waiter: waiter, context: context)
                 }
             }
         case .park(let connection):
-            logger.trace("parking connection",
+            context.logger.trace("parking connection",
                          metadata: ["ahc-connection": "\(connection)"])
             connection.setIdleTimeout(timeout: self.configuration.connectionPool.idleTimeout,
-                                      logger: self.backgroundActivityLogger)
+                                      context: DefaultLoggingContext(context: context).withLogger(backgroundActivityLogger))
         case .closeProvider:
-            logger.debug("closing provider",
+            context.logger.debug("closing provider",
                          metadata: ["ahc-provider": "\(self)"])
             self.closeAndDelete()
         case .none:
             break
         case .parkAnd(let connection, let action):
-            logger.trace("parking connection & doing further action",
+            context.logger.trace("parking connection & doing further action",
                          metadata: ["ahc-connection": "\(connection)",
                                     "ahc-action": "\(action)"])
             connection.setIdleTimeout(timeout: self.configuration.connectionPool.idleTimeout,
-                                      logger: self.backgroundActivityLogger)
-            self.execute(action, logger: logger)
+                                      context: DefaultLoggingContext(context: context).withLogger(backgroundActivityLogger))
+            self.execute(action, context: context)
         case .closeAnd(let connection, let action):
-            logger.trace("closing connection & doing further action",
+            context.logger.trace("closing connection & doing further action",
                          metadata: ["ahc-connection": "\(connection)",
                                     "ahc-action": "\(action)"])
             connection.channel.close(promise: nil)
-            self.execute(action, logger: logger)
+            self.execute(action, context: context)
         case .fail(let waiter, let error):
-            logger.debug("failing connection for waiter",
+            context.logger.debug("failing connection for waiter",
                          metadata: ["ahc-waiter": "\(waiter)",
                                     "ahc-error": "\(error)"])
             waiter.promise.fail(error)
@@ -315,23 +315,23 @@ class HTTP1ConnectionProvider {
 
     func getConnection(preference: HTTPClient.EventLoopPreference,
                        setupComplete: EventLoopFuture<Void>,
-                       logger: Logger) -> EventLoopFuture<Connection> {
+                       context: LoggingContext) -> EventLoopFuture<Connection> {
         let waiter = Waiter<Connection>(promise: self.eventLoop.makePromise(), setupComplete: setupComplete, preference: preference)
 
         let action: Action = self.lock.withLock {
             self.state.acquire(waiter: waiter)
         }
 
-        self.execute(action, logger: logger)
+        self.execute(action, context: context)
 
         return waiter.promise.futureResult
     }
 
-    func connect(_ result: Result<Channel, Error>, waiter: Waiter<Connection>, logger: Logger) {
+    func connect(_ result: Result<Channel, Error>, waiter: Waiter<Connection>, context: LoggingContext) {
         let action: Action<Connection>
         switch result {
         case .success(let channel):
-            logger.trace("successfully created connection",
+            context.logger.trace("successfully created connection",
                          metadata: ["ahc-connection": "\(channel)"])
             let connection = Connection(channel: channel, provider: self)
             action = self.lock.withLock {
@@ -341,7 +341,7 @@ class HTTP1ConnectionProvider {
             switch action {
             case .closeAnd:
                 // This happens when client was shut down during connect
-                logger.trace("connection cancelled due to client shutdown",
+                context.logger.trace("connection cancelled due to client shutdown",
                              metadata: ["ahc-connection": "\(channel)"])
                 connection.channel.close(promise: nil)
                 waiter.promise.fail(HTTPClientError.cancelled)
@@ -349,7 +349,7 @@ class HTTP1ConnectionProvider {
                 waiter.promise.succeed(connection)
             }
         case .failure(let error):
-            logger.debug("connection attempt failed",
+            context.logger.debug("connection attempt failed",
                          metadata: ["ahc-error": "\(error)"])
             action = self.lock.withLock {
                 self.state.connectFailed()
@@ -358,12 +358,12 @@ class HTTP1ConnectionProvider {
         }
 
         waiter.setupComplete.whenComplete { _ in
-            self.execute(action, logger: logger)
+            self.execute(action, context: context)
         }
     }
 
-    func release(connection: Connection, closing: Bool, logger: Logger) {
-        logger.debug("releasing connection, request complete",
+    func release(connection: Connection, closing: Bool, context: LoggingContext) {
+        context.logger.debug("releasing connection, request complete",
                      metadata: ["ahc-closing": "\(closing)"])
         let action: Action = self.lock.withLock {
             self.state.release(connection: connection, closing: closing)
@@ -383,31 +383,31 @@ class HTTP1ConnectionProvider {
         case .park, .closeProvider:
             // Since both `.park` and `.deleteProvider` are terminal in terms of execution,
             // we can execute them immediately
-            self.execute(action, logger: logger)
+            self.execute(action, context: context)
         case .closeAnd, .create, .fail, .lease, .parkAnd, .replace:
             // This is needed to start a new stack, otherwise, since this is called on a previous
             // future completion handler chain, it will be growing indefinitely until the connection is closed.
             // We might revisit this when https://github.com/apple/swift-nio/issues/970 is resolved.
             connection.eventLoop.execute {
-                self.execute(action, logger: logger)
+                self.execute(action, context: context)
             }
         }
     }
 
-    func remoteClosed(connection: Connection, logger: Logger) {
+    func remoteClosed(connection: Connection, context: LoggingContext) {
         let action: Action = self.lock.withLock {
             self.state.remoteClosed(connection: connection)
         }
 
-        self.execute(action, logger: logger)
+        self.execute(action, context: context)
     }
 
-    func timeout(connection: Connection, logger: Logger) {
+    func timeout(connection: Connection, context: LoggingContext) {
         let action: Action = self.lock.withLock {
             self.state.timeout(connection: connection)
         }
 
-        self.execute(action, logger: logger)
+        self.execute(action, context: context)
     }
 
     private func closeAndDelete() {
@@ -438,14 +438,13 @@ class HTTP1ConnectionProvider {
         return self.closePromise.futureResult.map { true }
     }
 
-    private func makeChannel(preference: HTTPClient.EventLoopPreference,
-                             logger: Logger) -> EventLoopFuture<Channel> {
+    private func makeChannel(preference: HTTPClient.EventLoopPreference, context: LoggingContext) -> EventLoopFuture<Channel> {
         return NIOClientTCPBootstrap.makeHTTP1Channel(destination: self.key,
                                                       eventLoop: self.eventLoop,
                                                       configuration: self.configuration,
                                                       sslContextCache: self.pool.sslContextCache,
                                                       preference: preference,
-                                                      logger: logger)
+                                                      context: context)
     }
 
     /// A `Waiter` represents a request that waits for a connection when none is

@@ -15,6 +15,8 @@
 import Baggage
 import Foundation
 import Instrumentation
+import Tracing
+import TracingOpenTelemetrySupport
 import Logging
 import NIO
 import NIOConcurrencyHelpers
@@ -532,6 +534,21 @@ public class HTTPClient {
     ///
     /// - parameters:
     ///     - request: HTTP request to execute.
+    ///     - eventLoop: NIO Event Loop preference.
+    ///     - deadline: Point in time by which the request must complete.
+    ///     - logger: The logger to use for this request.
+    public func execute(request: Request,
+                        eventLoop eventLoopPreference: EventLoopPreference,
+                        deadline: NIODeadline? = nil,
+                        context: LoggingContext) -> EventLoopFuture<Response> {
+        let accumulator = ResponseAccumulator(request: request)
+        return self.execute(request: request, delegate: accumulator, eventLoop: eventLoopPreference, context: context, deadline: deadline).futureResult
+    }
+
+    /// Execute arbitrary HTTP request and handle response processing using provided delegate.
+    ///
+    /// - parameters:
+    ///     - request: HTTP request to execute.
     ///     - delegate: Delegate to process response parts.
     ///     - deadline: Point in time by which the request must complete.
     public func execute<Delegate: HTTPClientResponseDelegate>(request: Request,
@@ -594,21 +611,16 @@ public class HTTPClient {
     ///     - delegate: Delegate to process response parts.
     ///     - eventLoop: NIO Event Loop preference.
     ///     - deadline: Point in time by which the request must complete.
-    ///     - context: The logging context carrying a logger and instrumentation metadata.
     public func execute<Delegate: HTTPClientResponseDelegate>(request: Request,
                                                               delegate: Delegate,
                                                               eventLoop eventLoopPreference: EventLoopPreference,
-                                                              context: LoggingContext?,
-                                                              deadline: NIODeadline? = nil) -> Task<Delegate.Response> {
-        var request = request
-        if let baggage = context?.baggage {
-            InstrumentationSystem.instrument.inject(baggage, into: &request.headers, using: HTTPHeadersInjector())
-        }
+                                                              deadline: NIODeadline? = nil,
+                                                              logger originalLogger: Logger?) -> Task<Delegate.Response> {
         return self.execute(request: request,
                             delegate: delegate,
                             eventLoop: eventLoopPreference,
-                            deadline: deadline,
-                            logger: context?.logger)
+                            context: DefaultLoggingContext.topLevel(logger: originalLogger ?? Self.loggingDisabled),
+                            deadline: deadline)
     }
 
     /// Execute arbitrary HTTP request and handle response processing using provided delegate.
@@ -618,12 +630,53 @@ public class HTTPClient {
     ///     - delegate: Delegate to process response parts.
     ///     - eventLoop: NIO Event Loop preference.
     ///     - deadline: Point in time by which the request must complete.
+    ///     - context: The logging context carrying a logger and instrumentation metadata.
     public func execute<Delegate: HTTPClientResponseDelegate>(request: Request,
                                                               delegate: Delegate,
                                                               eventLoop eventLoopPreference: EventLoopPreference,
-                                                              deadline: NIODeadline? = nil,
-                                                              logger originalLogger: Logger?) -> Task<Delegate.Response> {
-        let logger = (originalLogger ?? HTTPClient.loggingDisabled).attachingRequestInformation(request, requestID: globalRequestID.add(1))
+                                                              context: LoggingContext? = nil,
+                                                              deadline: NIODeadline? = nil) -> Task<Delegate.Response> {
+        return self.execute(request: request,
+                            delegate: delegate,
+                            eventLoop: eventLoopPreference,
+                            context: context ?? Self.loggingDisabledTopLevelContext,
+                            deadline: deadline)
+    }
+
+    private func execute<Delegate: HTTPClientResponseDelegate>(request: Request,
+                                                               delegate: Delegate,
+                                                               eventLoop eventLoopPreference: EventLoopPreference,
+                                                               context: LoggingContext,
+                                                               deadline: NIODeadline? = nil) -> Task<Delegate.Response> {
+        let span = InstrumentationSystem.tracer.startSpan("HTTP \(request.method.rawValue)",
+                                                          context: context,
+                                                          ofKind: .client)
+        span.attributes.http.method = request.method.rawValue
+        span.attributes.http.url = request.url.absoluteString
+        var context = DefaultLoggingContext(context: context).withBaggage(span.baggage)
+        context.logger = context.logger.attachingRequestInformation(request, requestID: globalRequestID.add(1))
+        let task = self.execute(request: request,
+                            delegate: delegate,
+                            eventLoop: eventLoopPreference,
+                            context: context,
+                            span: span,
+                            deadline: deadline)
+        task.futureResult.whenComplete { result in
+            if case .failure(let error) = result {
+                span.recordError(error)
+                span.setStatus(SpanStatus(code: .error))
+            }
+            span.end()
+        }
+        return task
+    }
+
+    private func execute<Delegate: HTTPClientResponseDelegate>(request: Request,
+                                                               delegate: Delegate,
+                                                               eventLoop eventLoopPreference: EventLoopPreference,
+                                                               context: LoggingContext,
+                                                               span: Span,
+                                                               deadline: NIODeadline? = nil) -> Task<Delegate.Response> {
         let taskEL: EventLoop
         switch eventLoopPreference.preference {
         case .indifferent:
@@ -637,7 +690,8 @@ public class HTTPClient {
         case .testOnly_exact(_, delegateOn: let delegateEL):
             taskEL = delegateEL
         }
-        logger.trace("selected EventLoop for task given the preference",
+
+        context.logger.trace("selected EventLoop for task given the preference",
                      metadata: ["ahc-eventloop": "\(taskEL)",
                                 "ahc-el-preference": "\(eventLoopPreference)"])
 
@@ -646,10 +700,10 @@ public class HTTPClient {
             case .upAndRunning:
                 return nil
             case .shuttingDown, .shutDown:
-                logger.debug("client is shutting down, failing request")
+                context.logger.debug("client is shutting down, failing request")
                 return Task<Delegate.Response>.failedTask(eventLoop: taskEL,
                                                           error: HTTPClientError.alreadyShutdown,
-                                                          logger: logger)
+                                                          context: context)
             }
         }
 
@@ -674,24 +728,24 @@ public class HTTPClient {
             redirectHandler = nil
         }
 
-        let task = Task<Delegate.Response>(eventLoop: taskEL, logger: logger)
+        let task = Task<Delegate.Response>(eventLoop: taskEL, context: context)
         let setupComplete = taskEL.makePromise(of: Void.self)
         let connection = self.pool.getConnection(request,
                                                  preference: eventLoopPreference,
                                                  taskEventLoop: taskEL,
                                                  deadline: deadline,
                                                  setupComplete: setupComplete.futureResult,
-                                                 logger: logger)
+                                                 context: context)
 
         let taskHandler = TaskHandler(task: task,
                                       kind: request.kind,
                                       delegate: delegate,
                                       redirectHandler: redirectHandler,
                                       ignoreUncleanSSLShutdown: self.configuration.ignoreUncleanSSLShutdown,
-                                      logger: logger)
+                                      span: span)
 
         connection.flatMap { connection -> EventLoopFuture<Void> in
-            logger.debug("got connection for request",
+            context.logger.debug("got connection for request",
                          metadata: ["ahc-connection": "\(connection)",
                                     "ahc-request": "\(request.method) \(request.url)",
                                     "ahc-channel-el": "\(connection.channel.eventLoop)",
@@ -709,7 +763,7 @@ public class HTTPClient {
 
                     try syncPipelineOperations.addHandler(taskHandler)
                 } catch {
-                    connection.release(closing: true, logger: logger)
+                    connection.release(closing: true, context: context)
                     return channel.eventLoop.makeFailedFuture(error)
                 }
 

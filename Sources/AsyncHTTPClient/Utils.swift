@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Baggage
 import Foundation
 #if canImport(Network)
     import Network
@@ -59,7 +60,7 @@ extension NIOClientTCPBootstrap {
                                  configuration: HTTPClient.Configuration,
                                  sslContextCache: SSLContextCache,
                                  preference: HTTPClient.EventLoopPreference,
-                                 logger: Logger) -> EventLoopFuture<Channel> {
+                                 context: LoggingContext) -> EventLoopFuture<Channel> {
         let channelEventLoop = preference.bestEventLoop ?? eventLoop
 
         let key = destination
@@ -74,7 +75,7 @@ extension NIOClientTCPBootstrap {
             // plaintext to the proxy but we do support sending HTTPS traffic through the proxy.
             sslContext = sslContextCache.sslContext(tlsConfiguration: configuration.tlsConfiguration ?? .forClient(),
                                                     eventLoop: eventLoop,
-                                                    logger: logger).map { $0 }
+                                                    context: context).map { $0 }
         } else {
             sslContext = eventLoop.makeSucceededFuture(nil)
         }
@@ -85,7 +86,7 @@ extension NIOClientTCPBootstrap {
                                                                         requiresTLS: requiresTLS,
                                                                         configuration: configuration,
                                                                         sslContextCache: sslContextCache,
-                                                                        logger: logger)
+                                                                        context: context)
         return bootstrap.flatMap { bootstrap -> EventLoopFuture<Channel> in
             let channel: EventLoopFuture<Channel>
             switch key.scheme {
@@ -124,7 +125,7 @@ extension NIOClientTCPBootstrap {
         requiresTLS: Bool,
         configuration: HTTPClient.Configuration,
         sslContextCache: SSLContextCache,
-        logger: Logger
+        context: LoggingContext
     ) -> EventLoopFuture<NIOClientTCPBootstrap> {
         return self.makeBestBootstrap(host: host,
                                       eventLoop: eventLoop,
@@ -132,7 +133,7 @@ extension NIOClientTCPBootstrap {
                                       sslContextCache: sslContextCache,
                                       tlsConfiguration: configuration.tlsConfiguration ?? .forClient(),
                                       useProxy: configuration.proxy != nil,
-                                      logger: logger)
+                                      context: context)
             .map { bootstrap -> NIOClientTCPBootstrap in
                 var bootstrap = bootstrap
 
@@ -174,7 +175,7 @@ extension NIOClientTCPBootstrap {
         sslContextCache: SSLContextCache,
         tlsConfiguration: TLSConfiguration,
         useProxy: Bool,
-        logger: Logger
+        context: LoggingContext
     ) -> EventLoopFuture<NIOClientTCPBootstrap> {
         #if canImport(Network)
             // if eventLoop is compatible with NIOTransportServices create a NIOTSConnectionBootstrap
@@ -196,7 +197,7 @@ extension NIOClientTCPBootstrap {
             } else {
                 return sslContextCache.sslContext(tlsConfiguration: tlsConfiguration,
                                                   eventLoop: eventLoop,
-                                                  logger: logger)
+                                                  context: context)
                     .flatMapThrowing { sslContext in
                         let hostname = (host.isIPAddress || host.isEmpty) ? nil : host
                         let tlsProvider = try NIOSSLClientTLSProvider<ClientBootstrap>(context: sslContext, serverHostname: hostname)

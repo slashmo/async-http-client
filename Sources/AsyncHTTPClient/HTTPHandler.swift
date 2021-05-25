@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Tracing
 import Foundation
 import Logging
 import NIO
@@ -636,19 +637,19 @@ extension HTTPClient {
         var connection: Connection?
         var cancelled: Bool
         let lock: Lock
-        let logger: Logger // We are okay to store the logger here because a Task is for only one request.
+        let context: LoggingContext // We are okay to store the logging context here because a Task is for only one request.
 
-        init(eventLoop: EventLoop, logger: Logger) {
+        init(eventLoop: EventLoop, context: LoggingContext) {
             self.eventLoop = eventLoop
             self.promise = eventLoop.makePromise()
             self.completion = self.promise.futureResult.map { _ in }
             self.cancelled = false
             self.lock = Lock()
-            self.logger = logger
+            self.context = context
         }
 
-        static func failedTask(eventLoop: EventLoop, error: Error, logger: Logger) -> Task<Response> {
-            let task = self.init(eventLoop: eventLoop, logger: logger)
+        static func failedTask(eventLoop: EventLoop, error: Error, context: LoggingContext) -> Task<Response> {
+            let task = self.init(eventLoop: eventLoop, context: context)
             task.promise.fail(error)
             return task
         }
@@ -721,7 +722,7 @@ extension HTTPClient {
                 return connection.removeHandler(IdleStateHandler.self).flatMap {
                     connection.removeHandler(TaskHandler<Delegate>.self)
                 }.map {
-                    connection.release(closing: closing, logger: self.logger)
+                    connection.release(closing: closing, context: self.context)
                 }.flatMapError { error in
                     fatalError("Couldn't remove taskHandler: \(error)")
                 }
@@ -755,7 +756,7 @@ internal class TaskHandler<Delegate: HTTPClientResponseDelegate>: RemovableChann
     let delegate: Delegate
     let redirectHandler: RedirectHandler<Delegate.Response>?
     let ignoreUncleanSSLShutdown: Bool
-    let logger: Logger // We are okay to store the logger here because a TaskHandler is just for one request.
+    private weak var span: Span?
 
     var state: State = .idle
     var responseReadBuffer: ResponseReadBuffer = ResponseReadBuffer()
@@ -777,13 +778,13 @@ internal class TaskHandler<Delegate: HTTPClientResponseDelegate>: RemovableChann
          delegate: Delegate,
          redirectHandler: RedirectHandler<Delegate.Response>?,
          ignoreUncleanSSLShutdown: Bool,
-         logger: Logger) {
+         span: Span) {
         self.task = task
         self.delegate = delegate
         self.redirectHandler = redirectHandler
         self.ignoreUncleanSSLShutdown = ignoreUncleanSSLShutdown
         self.kind = kind
-        self.logger = logger
+        self.span = span
     }
 }
 
@@ -881,6 +882,11 @@ extension TaskHandler: ChannelDuplexHandler {
                                    method: request.method,
                                    uri: request.uri)
         var headers = request.headers
+        if let span = self.span {
+            span.attributes.net.peer.ip = context.remoteAddress?.ipAddress
+            span.attributes.http.flavor = "\(head.version.major).\(head.version.minor)"
+            InstrumentationSystem.instrument.inject(span.baggage, into: &headers, using: HTTPHeadersInjector())
+        }
 
         if !request.headers.contains(name: "host") {
             let port = request.port
@@ -1030,6 +1036,10 @@ extension TaskHandler: ChannelDuplexHandler {
         let response = self.unwrapInboundIn(data)
         switch response {
         case .head(let head):
+            span?.attributes.http.statusCode = Int(head.status.code)
+            if 400 ..< 600 ~= head.status.code {
+                span?.setStatus(SpanStatus(code: .error))
+            }
             switch self.state {
             case .idle:
                 // should be prevented by NIO HTTP1 pipeline, see testHTTPResponseHeadBeforeRequestHead

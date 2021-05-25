@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Baggage
 import Dispatch
 import Logging
 import NIO
@@ -27,19 +28,19 @@ class SSLContextCache {
 extension SSLContextCache {
     func sslContext(tlsConfiguration: TLSConfiguration,
                     eventLoop: EventLoop,
-                    logger: Logger) -> EventLoopFuture<NIOSSLContext> {
+                    context: LoggingContext) -> EventLoopFuture<NIOSSLContext> {
         let eqTLSConfiguration = BestEffortHashableTLSConfiguration(wrapping: tlsConfiguration)
         let sslContext = self.lock.withLock {
             self.sslContextCache.find(key: eqTLSConfiguration)
         }
 
         if let sslContext = sslContext {
-            logger.debug("found SSL context in cache",
+            context.logger.debug("found SSL context in cache",
                          metadata: ["ahc-tls-config": "\(tlsConfiguration)"])
             return eventLoop.makeSucceededFuture(sslContext)
         }
 
-        logger.debug("creating new SSL context",
+        context.logger.debug("creating new SSL context",
                      metadata: ["ahc-tls-config": "\(tlsConfiguration)"])
         let newSSLContext = self.offloadQueue.asyncWithFuture(eventLoop: eventLoop) {
             try NIOSSLContext(configuration: tlsConfiguration)
