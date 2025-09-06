@@ -12,9 +12,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Instrumentation
 import Logging
 import NIOCore
 import NIOHTTP1
+import ServiceContextModule
 
 import struct Foundation.URL
 
@@ -84,6 +86,13 @@ extension HTTPClient {
         redirectState: RedirectState?
     ) async throws -> HTTPClientResponse {
         var currentRequest = request
+        if let serviceContext = ServiceContext.current {
+            InstrumentationSystem.instrument.inject(
+                serviceContext,
+                into: &currentRequest.headers,
+                using: HTTPHeadersInjector()
+            )
+        }
         var currentRedirectState = redirectState
         var history: [HTTPClientRequestResponse] = []
 
@@ -249,5 +258,11 @@ private actor TransactionCancelHandler {
         Task {
             await self._cancel(reason: reason)
         }
+    }
+}
+
+private struct HTTPHeadersInjector: Injector {
+    func inject(_ value: String, forKey name: String, into headers: inout HTTPHeaders) {
+        headers.replaceOrAdd(name: name, value: value)
     }
 }
